@@ -1,0 +1,7 @@
+____________________________________________________________________________
+[  2677] By: autrijus                              on 2002/12/11  16:52:29
+        Log: * Apache::Filter::HanConvert 0.01, an Apache2 module
+             that does intelligent simp/trad Chinese handling
+             and recoding.
+	   + HanConvert.pm MANIFEST Makefile.PL README
+	   + t/0-signature.t t/1-basic.t
