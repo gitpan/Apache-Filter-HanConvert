@@ -1,8 +1,8 @@
 # $File: //member/autrijus/Apache-Filter-HanConvert/HanConvert.pm $ $Author: autrijus $
-# $Revision: #1 $ $Change: 2677 $ $DateTime: 2002/12/11 16:52:29 $
+# $Revision: #4 $ $Change: 2690 $ $DateTime: 2002/12/12 06:47:15 $
 
 package Apache::Filter::HanConvert;
-$Apache::Filter::HanConvert::VERSION = '0.01';
+$Apache::Filter::HanConvert::VERSION = '0.02';
 
 use strict;
 use warnings;
@@ -13,12 +13,12 @@ Apache::Filter::HanConvert - Filter between Chinese variant and encodings
 
 =head1 VERSION
 
-This document describes version 0.01 of Apache::Filter::HanConvert, released
+This document describes version 0.02 of Apache::Filter::HanConvert, released
 December 12, 2002.
 
 =head1 SYNOPSIS
 
-In httpd.conf:
+In F<httpd.conf>:
 
     PerlModule Apache::Filter::HanConvert
     PerlOutputFilterHandler Apache::Filter::HanConvert
@@ -32,9 +32,13 @@ solution for serving multiple encoding/variants from the same source
 documents.
 
 From the settings in L</SYNOPSIS>, the server would negotiate with the
-client's browser about the Traditional/Simplified choice (C<zh-cn> and
-C<zh> means Simplified, other C<zh-*> means Traditional), and serve
-UTF-8 documents by default.
+client's browser about their C<Accept-Language> preference (C<zh-cn> and
+C<zh> means Simplified, other C<zh-*> means Traditional), as well as the
+preferred C<Accept-Charset> setting (defaults to C<utf8> if nothing
+was explicitly specified).
+
+The C<Content-Type> header will be rewritten to reflect the final
+encoding used.
 
 If you want to use other encodings, try adding these lines:
 
@@ -47,6 +51,15 @@ variant/encoding, use this:
 
     PerlSetVar HanConvertToVariant "simplified"
     PerlSetVar HanConvertToEncoding "gbk"
+
+=head1 CAVEATS
+
+The C<HanConvertFromEncoding> config probably could take multiple
+encodings and apply L<Encode::Guess> to find out the correct source
+encoding.
+
+Currently this module does not work with C<mod_dir>, so the server's
+C<DirectoryIndex> setting won't be honored.  Patches welcome!
 
 =cut
 
@@ -75,13 +88,53 @@ my %encodings = (
     'S'	    => 'HanConvertToEncodingSimplified',
 );
 
+my %charsets = (
+    'T'	    => qr{
+	big-?5				    |
+	big5-?et(:en)?			    |
+	(?:tca|tw)[-_]?big5		    |
+	big5-?hk(?:scs)?		    |
+	hk(?:scs)?[-_]?big5		    |
+	MacChineseTrad			    |
+	cp950				    |
+	(?:x-)winddows-950		    |
+	(?:cmex[-_]|tw[-_])?big5-?e(?:xt)?  |
+	(?:cmex[-_]|tw[-_])?big5-?p(?:lus)? |
+	(?:cmex[-_]|tw[-_])?big5\+	    |
+	(?:ccag[-_])?cccii		    |
+	euc[-_]tw			    |
+	tw[-_]euc			    |
+	utf-?8				    |
+	ucs-?2[bl]e			    |
+	utf-?(?:16|32)(?:[bl]e)?
+    }x,
+    'S'	    => qr{
+	euc[-_]cn			    |
+	cn[-_]euc			    |
+	iso-ir-165			    |
+	MacChineseSimp			    |
+	cp936				    |
+	(?:x-)winddows-936		    |
+	hz				    |
+	gb[-_ ]?2312(?:\D+)?		    |
+	gb[-_ ]?18030			    |
+	utf-?8				    |
+	ucs-?2[bl]e			    |
+	utf-?(?:16|32)(?:[bl]e)?
+    }x
+);
+
 sub Apache::Filter::HanConvert::handler {
     my($filter, $bb) = @_;
 
     my $r = $filter->r;
+    my $content_type = $r->content_type;
+
+    return Apache::DECLINED
+	if defined( $content_type ) and $content_type !~ m|^text/|io;
 
     my $from_variant  = uc(substr($r->dir_config("HanConvertFromVariant"), 0, 1)) || 'X';
-    my $from_encoding = $r->dir_config("HanConvertFromEncoding") || 'UTF-8';
+    my $from_encoding = $r->dir_config("HanConvertFromEncoding");
     my $to_variant    = uc(substr($r->dir_config("HanConvertToVariant"), 0, 1));
     my $to_encoding   = $r->dir_config("HanConvertToEncoding");
 
@@ -94,12 +147,25 @@ sub Apache::Filter::HanConvert::handler {
 
     return Apache::DECLINED unless $to_variant;
 
-    $to_encoding ||= $r->dir_config($encodings{$to_variant}) || 'UTF-8';
+    $to_encoding ||= $r->dir_config($encodings{$to_variant});
+    
+    if (!$to_encoding) {
+	my $chars = $r->headers_in->get('Accept-Charset');
+
+	$to_encoding = $1
+	    if $chars =~ /\b($charsets{$to_variant})\b/i;
+    }
+
+    my $var_enc	   = $variants{"$from_variant$to_variant"} || 'utf8';
+    $from_encoding = Encode::resolve_alias($from_encoding) || 'utf8';
+    $to_encoding   = Encode::resolve_alias($to_encoding)   || 'utf8';
 
     return Apache::DECLINED if $from_encoding eq $to_encoding
 			    and $from_variant eq $to_variant;
 
-    my $var_enc = $variants{"$from_variant$to_variant"} || 'UTF-8';
+    my $charset = ($to_encoding eq 'utf8' ? 'utf-8' : $to_encoding);
+    $content_type =~ s/(?:;charset=[^;]+(.*))?$/;charset=$charset$1/;
+    $r->content_type($content_type);
 
     my $c = $filter->c;
     my $bb_ctx = APR::Brigade->new($c->pool, $c->bucket_alloc);
@@ -119,8 +185,8 @@ sub Apache::Filter::HanConvert::handler {
 	my $status = $bucket->read($buffer);
 	return $status unless $status == APR::SUCCESS;
 
-	Encode::from_to($buffer, $from_encoding => 'UTF-8', Encode::FB_HTMLCREF)
-	    if $from_encoding ne 'UTF-8';
+	Encode::from_to($buffer, $from_encoding => 'utf8', Encode::FB_HTMLCREF)
+	    if $from_encoding ne 'utf8';
 
 	if ($var_enc eq $to_encoding) {
 	    $bucket = APR::Bucket->new( $buffer );
